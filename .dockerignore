@@ -6,7 +6,6 @@ __pycache__/
 .gitignore
 .env
 .env.*
-README.md
 *.egg-info/
 dist/
 build/
