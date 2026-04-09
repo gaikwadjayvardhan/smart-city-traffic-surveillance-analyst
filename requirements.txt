@@ -16,6 +16,9 @@ openai>=1.55.0,<2.0.0
 # Dotenv support (local dev — reads .env file for credentials)
 python-dotenv==1.0.1
 
+# HTTP client — used by inference.py to talk to the environment API
+requests>=2.31.0
+
 # OpenEnv core (try to install; graceful fallback if not on PyPI yet)
 # Uncomment when openenv-core ships to PyPI:
 # openenv-core>=0.2.3

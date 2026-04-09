@@ -1,17 +1,18 @@
 """
-inference.py — Baseline Agent Evaluation Script
-================================================
-Runs a GPT-compatible LLM agent against all 3 tasks using the official
-OpenAI Python client.  Emits structured stdout logs in the exact
-[START] / [STEP] / [END] format required by the OpenEnv automated validator.
+Inference Script — Smart City Traffic Surveillance Analyst
+==========================================================
+MANDATORY environment variables:
+    API_BASE_URL        The API endpoint for the LLM.
+    MODEL_NAME          The model identifier to use for inference.
+    HF_TOKEN            Your HuggingFace / API key.
+    IMAGE_NAME          Local Docker image name (if using from_docker_image).
+    SPACE_URL           HF Space base URL (e.g. https://user-space.hf.space)
+                        Falls back to http://localhost:7860 for local runs.
 
-Runtime budget: <20 minutes on 2vCPU / 8 GB RAM.
-Credentials:    Read from environment variables (never hard-coded).
-
-Log format contract (do NOT alter):
-  [START] task=<name> episode=<id>
-  [STEP] step=<n> action=<json> reward=<f> done=<bool>
-  [END] task=<name> episode=<id> score=<f> steps=<n>
+STDOUT FORMAT (exact — do not alter):
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 from __future__ import annotations
@@ -20,313 +21,391 @@ import json
 import os
 import sys
 import time
+import textwrap
+import subprocess
+import threading
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Lazy imports — only fail at call site, not at module import
+# Credentials and config — read from env vars, never hard-coded
 # ---------------------------------------------------------------------------
-def _get_openai_client():
-    """Return an openai.OpenAI client configured from environment variables."""
-    try:
-        import openai  # type: ignore
-    except ImportError as e:
-        print(f"[ERROR] openai package not installed: {e}", file=sys.stderr)
-        sys.exit(1)
+IMAGE_NAME    = os.getenv("IMAGE_NAME")                            # local docker image
+API_KEY       = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY", "sk-placeholder")
+API_BASE_URL  = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME    = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+SPACE_URL     = os.getenv("SPACE_URL", "http://localhost:7860").rstrip("/")
 
-    api_base = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("HF_TOKEN", "sk-placeholder")
-    model_name = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+BENCHMARK     = "smart-city-traffic-surveillance"
+MAX_STEPS     = 20
+TEMPERATURE   = 0.0
+MAX_TOKENS    = 512
+SUCCESS_SCORE_THRESHOLD = 0.5
 
-    client = openai.OpenAI(base_url=api_base, api_key=api_key)
-    return client, model_name
+TASKS = [
+    "collision_tagging",
+    "near_miss_detection",
+    "active_incident_management",
+]
+
+# ===========================================================================
+# Exact stdout log helpers — format is enforced by the validator
+# ===========================================================================
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Environment & task imports (lazy to avoid import-time failures)
-# ---------------------------------------------------------------------------
-def _import_env():
-    from environment import TrafficSurveillanceEnv, TrafficAction
-    from tasks import TASKS, run_grader
-    return TrafficSurveillanceEnv, TrafficAction, TASKS, run_grader
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val  = str(done).lower()   # must be lowercase: true / false
+    # action must be a single-line string (no embedded newlines)
+    action_oneline = action.replace("\n", " ")
+    print(
+        f"[STEP] step={step} action={action_oneline} "
+        f"reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    success_val = str(success).lower()
+    print(
+        f"[END] success={success_val} steps={steps} "
+        f"score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 # ===========================================================================
-# Structured Logger — validator-compatible format
+# Environment HTTP client — talks to the FastAPI server
 # ===========================================================================
 
-class OpenEnvLogger:
+class TrafficEnvClient:
     """
-    Emits structured stdout logs in the exact format expected by the
-    OpenEnv automated validator:
+    Thin HTTP wrapper around the FastAPI environment server.
 
-        [START] task=<name> episode=<id>
-        [STEP]  step=<n> action=<json_str> reward=<float> done=<bool>
-        [END]   task=<name> episode=<id> score=<float> steps=<int>
+    Supports two deployment modes:
+      1. LOCAL DOCKER  — starts IMAGE_NAME, waits for health, connects to :7860
+      2. HF SPACE / local server — connects directly to SPACE_URL
     """
 
-    @staticmethod
-    def start(task: str, episode: str) -> None:
-        print(f"[START] task={task} episode={episode}", flush=True)
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self._container_id: Optional[str] = None
+        # Lazy-import requests to avoid top-level import failures
+        try:
+            import requests as _req
+            self._requests = _req
+        except ImportError:
+            print("[ERROR] 'requests' package is required. pip install requests", file=sys.stderr)
+            sys.exit(1)
 
-    @staticmethod
-    def step(step: int, action: Dict, reward: float, done: bool) -> None:
-        action_str = json.dumps(action, separators=(",", ":"))
-        print(
-            f"[STEP] step={step} action={action_str} "
-            f"reward={reward:.4f} done={done}",
-            flush=True,
+    # ------------------------------------------------------------------
+    # Docker lifecycle (used when IMAGE_NAME is set)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_docker_image(cls, image_name: str, port: int = 7860) -> "TrafficEnvClient":
+        """Start a local Docker container and return a connected client."""
+        print(f"[INFO] Starting Docker container from image: {image_name}", flush=True)
+        result = subprocess.run(
+            ["docker", "run", "-d", "--rm", "-p", f"{port}:{port}", image_name],
+            capture_output=True, text=True,
         )
+        if result.returncode != 0:
+            print(f"[ERROR] docker run failed: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+        container_id = result.stdout.strip()
+        client = cls(f"http://localhost:{port}")
+        client._container_id = container_id
+        client._wait_for_health(timeout=60)
+        return client
 
-    @staticmethod
-    def end(task: str, episode: str, score: float, steps: int) -> None:
-        print(
-            f"[END] task={task} episode={episode} "
-            f"score={score:.4f} steps={steps}",
-            flush=True,
+    def _wait_for_health(self, timeout: int = 60) -> None:
+        """Poll /health until the container is ready."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                r = self._requests.get(f"{self.base_url}/health", timeout=3)
+                if r.status_code == 200:
+                    print("[INFO] Environment server is healthy", flush=True)
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+        print("[WARN] Health check timed out — proceeding anyway", flush=True)
+
+    def close(self) -> None:
+        """Stop the Docker container if we started one."""
+        if self._container_id:
+            subprocess.run(["docker", "stop", self._container_id], capture_output=True)
+            print(f"[INFO] Container {self._container_id[:12]} stopped", flush=True)
+
+    # ------------------------------------------------------------------
+    # OpenEnv API methods
+    # ------------------------------------------------------------------
+
+    def reset(self, task_name: str = "collision_tagging", seed: Optional[int] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"task_name": task_name}
+        if seed is not None:
+            payload["seed"] = seed
+        r = self._requests.post(
+            f"{self.base_url}/reset",
+            json=payload,
+            timeout=30,
         )
+        r.raise_for_status()
+        return r.json()
 
+    def step(self, action_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        r = self._requests.post(
+            f"{self.base_url}/step",
+            json={"action_type": action_type, "payload": payload},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
 
-log = OpenEnvLogger()
+    def state(self) -> Dict[str, Any]:
+        r = self._requests.get(f"{self.base_url}/state", timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def grade(self, task_name: str) -> float:
+        r = self._requests.post(
+            f"{self.base_url}/grade",
+            params={"task_name": task_name},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return float(r.json().get("score", 0.0))
 
 
 # ===========================================================================
-# Observation → Prompt Builder
+# LLM integration
 # ===========================================================================
 
-SYSTEM_PROMPT = """You are an AI traffic surveillance analyst. You receive real-time telemetry data from city traffic cameras.
+SYSTEM_PROMPT = textwrap.dedent("""
+You are an AI traffic surveillance analyst connected to city intersection cameras.
 
-Your available actions are:
-1. tag_collision    — {"action_type": "tag_collision", "payload": {"frame_id": <int>, "vehicle_ids": ["Vxxx", "Vyyy"]}}
-2. tag_near_miss    — {"action_type": "tag_near_miss", "payload": {"vehicle_ids": ["Vxxx"], "minimum_distance": <float_metres>}}
-3. dispatch_ems     — {"action_type": "dispatch_ems", "payload": {"coordinates": [lat, lon], "service_type": "ambulance"}}
-4. update_signs     — {"action_type": "update_signs", "payload": {"sign_ids": ["SIGN_N1"], "message": "ACCIDENT AHEAD - SLOW DOWN", "upstream": true}}
-5. advance_frame    — {"action_type": "advance_frame", "payload": {}}
-6. noop             — {"action_type": "noop", "payload": {}}
+AVAILABLE ACTIONS (respond with ONE valid JSON object per turn):
+  {"action_type": "advance_frame", "payload": {}}
+  {"action_type": "tag_collision",  "payload": {"frame_id": <int>, "vehicle_ids": ["V001","V002"]}}
+  {"action_type": "tag_near_miss",  "payload": {"vehicle_ids": ["V003"], "minimum_distance": <float_metres>}}
+  {"action_type": "dispatch_ems",   "payload": {"coordinates": [<lat>, <lon>], "service_type": "ambulance"}}
+  {"action_type": "update_signs",   "payload": {"sign_ids": ["SIGN_N1"], "message": "ACCIDENT AHEAD", "upstream": true}}
 
-Rules:
-- Always respond with a valid JSON object matching EXACTLY one of the above schemas.
-- Do NOT add markdown fences or extra text — output raw JSON only.
-- Advance frames to scan for collisions. When you detect an event, submit the appropriate action immediately.
-- For dispatch_ems, use the GPS coordinates of the collision/incident.
-"""
+RULES:
+- Output ONLY raw JSON — no markdown, no extra text.
+- Scan frames with advance_frame until you detect an event.
+- Collision = bounding boxes overlap AND both vehicles speed drops to 0.
+- Near-miss = vehicle enters <10 m radius of another vehicle without colliding.
+- For active_incident_management: tag collision, then dispatch_ems, then update_signs.
+""").strip()
 
-def _build_user_prompt(obs_dict: Dict, task_description: str, step: int) -> str:
-    """Convert current observation to a compact, token-efficient prompt string."""
-    frame = obs_dict.get("current_frame", 0)
-    total = obs_dict.get("total_frames", 30)
-    telemetry = obs_dict.get("telemetry_data", [])
-    alerts = obs_dict.get("active_alerts", [])
-    task = obs_dict.get("task_name", "unknown")
+
+def _build_prompt(obs: Dict[str, Any], task_name: str, step: int) -> str:
+    frame    = obs.get("current_frame", 0)
+    total    = obs.get("total_frames", 30)
+    tele     = obs.get("telemetry_data", [])
+    alerts   = obs.get("active_alerts", [])
 
     lines = [
-        f"TASK: {task}",
-        f"DESCRIPTION: {task_description}",
-        f"STEP: {step}  FRAME: {frame}/{total - 1}",
+        f"TASK: {task_name}  STEP: {step}  FRAME: {frame}/{total - 1}",
         "",
-        "=== TELEMETRY (current frame) ===",
+        "=== TELEMETRY ===",
     ]
-    for v in telemetry:
-        vid = v.get("vehicle_id", "?")
-        spd = v.get("speed_kmh", 0)
-        coords = v.get("coordinates", [0, 0])
-        bbox = v.get("bbox", [0, 0, 0, 0])
+    for v in tele:
+        vid   = v.get("vehicle_id", "?")
+        spd   = v.get("speed_kmh", 0)
+        coord = v.get("coordinates", [0, 0])
+        bbox  = v.get("bbox", [0, 0, 0, 0])
         lines.append(
-            f"  {vid}: speed={spd} km/h  gps=({coords[0]:.5f},{coords[1]:.5f})"
-            f"  bbox=[{bbox[0]:.1f},{bbox[1]:.1f},{bbox[2]:.1f},{bbox[3]:.1f}]"
+            f"  {vid}: speed={spd}km/h  gps=({coord[0]:.5f},{coord[1]:.5f})"
+            f"  bbox=[{bbox[0]:.0f},{bbox[1]:.0f},{bbox[2]:.0f},{bbox[3]:.0f}]"
         )
 
     if alerts:
-        lines.append("")
-        lines.append("=== ACTIVE ALERTS ===")
+        lines.append("\n=== ACTIVE ALERTS ===")
         for a in alerts:
-            lines.append(f"  [{a.get('alert_type','')}] vehicles={a.get('vehicle_ids',[])} frame={a.get('frame_id','N/A')}")
+            lines.append(f"  [{a.get('alert_type')}] vids={a.get('vehicle_ids')} frame={a.get('frame_id','?')}")
 
-    lines.append("")
-    lines.append("Respond with the next action JSON:")
+    lines.append("\nOutput your next action JSON:")
     return "\n".join(lines)
 
 
-# ===========================================================================
-# LLM → Action converter
-# ===========================================================================
+def _call_llm(client: Any, messages: List[Dict], model: str) -> str:
+    """Call the LLM with exponential backoff. Returns raw string."""
+    for attempt in range(3):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                stream=False,
+            )
+            return (completion.choices[0].message.content or "").strip()
+        except Exception as exc:
+            wait = 2 ** attempt
+            print(f"[DEBUG] LLM call failed (attempt {attempt+1}): {exc}. Retrying in {wait}s", flush=True)
+            time.sleep(wait)
+    return ""
 
-def _parse_llm_response(raw: str) -> Dict[str, Any]:
-    """
-    Parse the LLM's raw text output into an action dict.
-    Falls back to noop if parsing fails.
-    """
+
+def _parse_action(raw: str) -> tuple[str, Dict[str, Any]]:
+    """Parse LLM output → (action_type, payload). Falls back to advance_frame."""
     raw = raw.strip()
-    # Strip accidental markdown fences
+    # Strip markdown fences
     if raw.startswith("```"):
-        raw = raw.split("```")[1].lstrip("json").strip()
+        raw = "\n".join(raw.split("\n")[1:])
+        raw = raw.rstrip("`").strip()
     try:
         parsed = json.loads(raw)
-        if "action_type" in parsed:
-            return parsed
+        return parsed.get("action_type", "noop"), parsed.get("payload", {})
     except json.JSONDecodeError:
-        pass
-
-    # Heuristic extraction for common formats
-    import re
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group())
-            if "action_type" in parsed:
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    return {"action_type": "noop", "payload": {}}
-
-
-# ===========================================================================
-# Single-episode agent loop
-# ===========================================================================
-
-def run_episode(
-    task_name: str,
-    max_steps: int,
-    seed: int,
-    client: Any,
-    model_name: str,
-) -> Dict[str, Any]:
-    """
-    Run one full episode of the agent loop.
-
-    Returns dict with: task, episode_id, score, steps, conversation_history
-    """
-    TrafficSurveillanceEnv, TrafficAction, TASKS, run_grader = _import_env()
-
-    task_spec = TASKS[task_name]
-    env = TrafficSurveillanceEnv()
-
-    # Reset with deterministic seed for reproducibility
-    obs = env.reset(seed=seed, task_name=task_name)
-    episode_id = obs.episode_id or f"ep_{seed}"
-
-    log.start(task=task_name, episode=episode_id)
-
-    conversation: List[Dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
-
-    step = 0
-    done = False
-    last_reward = 0.0
-
-    while step < max_steps and not done:
-        step += 1
-
-        # Build prompt from current observation
-        obs_dict = obs.model_dump()
-        user_msg = _build_user_prompt(obs_dict, task_spec.description, step)
-        conversation.append({"role": "user", "content": user_msg})
-
-        # Query LLM (with exponential backoff on rate limits)
-        raw_response = ""
-        for attempt in range(3):
+        import re
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
             try:
-                completion = client.chat.completions.create(
-                    model=model_name,
-                    messages=conversation,
-                    max_tokens=256,
-                    temperature=0.0,
-                    timeout=30,
-                )
-                raw_response = completion.choices[0].message.content or ""
+                parsed = json.loads(m.group())
+                return parsed.get("action_type", "noop"), parsed.get("payload", {})
+            except Exception:
+                pass
+    return "advance_frame", {}
+
+
+# ===========================================================================
+# Single-task episode runner
+# ===========================================================================
+
+def run_episode(task_name: str, env_client: TrafficEnvClient, llm_client: Any) -> Dict[str, Any]:
+    """Run one full episode. Returns summary dict."""
+
+    rewards: List[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    last_error: Optional[str] = None
+
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+
+    try:
+        # RESET
+        obs = env_client.reset(task_name=task_name)
+        done = obs.get("done", False)
+
+        conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        for step in range(1, MAX_STEPS + 1):
+            if done:
                 break
+
+            # Build prompt and call LLM
+            user_msg = _build_prompt(obs, task_name, step)
+            conversation.append({"role": "user", "content": user_msg})
+            raw_response = _call_llm(llm_client, conversation, MODEL_NAME)
+
+            if not raw_response:
+                raw_response = '{"action_type":"advance_frame","payload":{}}'
+                last_error = "LLM returned empty response"
+
+            conversation.append({"role": "assistant", "content": raw_response})
+
+            action_type, payload = _parse_action(raw_response)
+
+            # Compact single-line action string for [STEP] log
+            action_str = json.dumps({"action_type": action_type, "payload": payload},
+                                    separators=(",", ":"))
+
+            # STEP
+            try:
+                obs = env_client.step(action_type, payload)
+                reward = float(obs.get("reward", 0.0))
+                done   = bool(obs.get("done", False))
+                last_error = None
             except Exception as e:
-                wait = 2 ** attempt
-                print(f"[WARN] LLM call failed (attempt {attempt+1}): {e}. Retrying in {wait}s…", file=sys.stderr)
-                time.sleep(wait)
-                raw_response = ""
+                reward     = 0.0
+                done       = False
+                last_error = str(e)
+                print(f"[DEBUG] step() error: {e}", flush=True)
 
-        if not raw_response:
-            raw_response = '{"action_type": "noop", "payload": {}}'
+            rewards.append(reward)
+            steps_taken = step
 
-        # Update conversation with assistant response
-        conversation.append({"role": "assistant", "content": raw_response})
+            log_step(step=step, action=action_str, reward=reward, done=done, error=last_error)
 
-        # Parse and validate action
-        action_dict = _parse_llm_response(raw_response)
+        # Grade via API
         try:
-            action = TrafficAction(**action_dict)
-        except Exception:
-            action = TrafficAction(action_type="noop", payload={})
+            score = env_client.grade(task_name)
+        except Exception as e:
+            print(f"[DEBUG] grade() failed: {e}", flush=True)
+            score = 0.0
 
-        # Step the environment
-        obs = env.step(action)
-        last_reward = obs.reward
-        done = obs.done
+        success = score >= SUCCESS_SCORE_THRESHOLD
 
-        log.step(step=step, action=action_dict, reward=last_reward, done=done)
+    except Exception as e:
+        last_error = str(e)
+        print(f"[DEBUG] Episode exception: {e}", flush=True)
 
-    # Grade the completed episode
-    state_dict = env.state.model_dump()
-    score = run_grader(task_name=task_name, submission=state_dict, env=env)
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
-    log.end(task=task_name, episode=episode_id, score=score, steps=step)
-
-    return {
-        "task": task_name,
-        "episode_id": episode_id,
-        "score": score,
-        "steps": step,
-        "cumulative_reward": state_dict.get("cumulative_reward", 0.0),
-    }
+    return {"task": task_name, "score": score, "steps": steps_taken, "success": success}
 
 
 # ===========================================================================
-# Main entrypoint
+# Main — runs all tasks sequentially
 # ===========================================================================
 
-def main():
-    """
-    Run inference across all tasks and print a summary.
-    Exits with code 1 if any task scores 0.0 (for CI pipelines).
-    """
+def main() -> None:
     print("=" * 60, flush=True)
     print("Smart City Traffic Surveillance Analyst — Inference", flush=True)
+    print(f"Model: {MODEL_NAME}   Space: {SPACE_URL}", flush=True)
     print("=" * 60, flush=True)
 
-    client, model_name = _get_openai_client()
-    print(f"[INFO] Using model: {model_name}", flush=True)
+    # Build LLM client (lazy import)
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("[ERROR] openai package not installed: pip install openai", file=sys.stderr)
+        sys.exit(1)
 
-    _, _, TASKS, _ = _import_env()
+    llm_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+    # Build environment client
+    if IMAGE_NAME:
+        env_client = TrafficEnvClient.from_docker_image(IMAGE_NAME)
+    else:
+        # Connect to running HF Space or local server
+        env_client = TrafficEnvClient(SPACE_URL)
+        env_client._wait_for_health(timeout=30)
 
     results = []
-    for task_name, task_spec in TASKS.items():
-        print(f"\n[INFO] Starting task: {task_name} (seed={task_spec.seed})", flush=True)
-        try:
-            result = run_episode(
-                task_name=task_name,
-                max_steps=task_spec.max_steps,
-                seed=task_spec.seed,
-                client=client,
-                model_name=model_name,
-            )
+    try:
+        for task_name in TASKS:
+            print(f"\n{'─'*60}", flush=True)
+            result = run_episode(task_name, env_client, llm_client)
             results.append(result)
-        except Exception as e:
-            print(f"[ERROR] Task {task_name} failed: {e}", file=sys.stderr)
-            results.append({"task": task_name, "score": 0.0, "steps": 0})
+            print(f"[INFO] Finished {task_name}: score={result['score']:.2f}", flush=True)
 
-    # Summary table
-    print("\n" + "=" * 60, flush=True)
-    print("INFERENCE SUMMARY", flush=True)
-    print("=" * 60, flush=True)
-    total_score = 0.0
+    finally:
+        env_client.close()
+
+    # Summary
+    print(f"\n{'='*60}", flush=True)
+    print("SUMMARY", flush=True)
+    print(f"{'='*60}", flush=True)
+    total = 0.0
     for r in results:
-        score = r.get("score", 0.0)
-        total_score += score
-        print(f"  {r['task']:35s}  score={score:.4f}  steps={r.get('steps', 0)}", flush=True)
+        total += r["score"]
+        status = "✓" if r["success"] else "✗"
+        print(f"  {status} {r['task']:<35} score={r['score']:.2f}", flush=True)
+    avg = total / len(results) if results else 0.0
+    print(f"\n  Average score: {avg:.2f}", flush=True)
 
-    avg_score = total_score / len(results) if results else 0.0
-    print(f"\n  Average score: {avg_score:.4f}", flush=True)
-    print("=" * 60, flush=True)
-
-    # Non-zero exit if all tasks failed (useful for CI)
-    if avg_score == 0.0:
+    if avg == 0.0:
         sys.exit(1)
 
 
