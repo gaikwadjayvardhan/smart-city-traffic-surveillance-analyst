@@ -1,41 +1,29 @@
 # ============================================================
 # Dockerfile — Smart City Traffic Surveillance Analyst
-# ============================================================
-# Builds a clean FastAPI server exposed on port 7860 for
-# HuggingFace Spaces automated pings (must return 200 OK on /).
-#
-# Build:  docker build -t traffic-env .
-# Run:    docker run -p 7860:7860 \
-#             -e OPENAI_API_KEY=sk-... \
-#             -e MODEL_NAME=gpt-4o-mini \
-#             traffic-env
+# Matches passing repo pattern: pip install . via pyproject.toml
 # ============================================================
 
-FROM python:3.11-slim
-
-# --- System dependencies ---
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM python:3.10.16-slim-bookworm
 
 WORKDIR /app
 
-# --- Python dependencies (installed before code copy for layer caching) ---
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy package manifest first for Docker layer caching
+COPY pyproject.toml .
+COPY README.md .
 
-# --- Application source ---
+# Install all dependencies via pyproject.toml (same as passing repo)
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
+
+# Copy all source files
 COPY . .
 
-# --- Port & environment defaults ---
+# HF Spaces requires port 7860
 EXPOSE 7860
 ENV PORT=7860
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
 
-# --- Health check so HuggingFace Space marks the container as healthy ---
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:7860/health || exit 1
+# Health check targeting /healthz (matches openenv.yaml endpoints spec)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/healthz')" || exit 1
 
-# --- Entrypoint ---
 CMD ["python", "app.py"]

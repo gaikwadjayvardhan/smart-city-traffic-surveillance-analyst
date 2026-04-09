@@ -1,137 +1,41 @@
-## Smart City Traffic Surveillance Analyst
-## OpenEnv Environment Metadata Configuration
-## -------------------------------------------------
-## Validated against openenv-core>=0.2.3 schema
+version: "1.0"
+name: "smart-city-traffic-surveillance-analyst"
+description: "OpenEnv-compliant environment for evaluating AI traffic surveillance agents on collision detection, near-miss identification, and emergency dispatch tasks."
 
-api_version: "1.0"
-transport: websocket
+entry_point: "app:make_app"
 
-name: smart-city-traffic-surveillance-analyst
-display_name: "Smart City Traffic Surveillance Analyst"
-version: "1.0.0"
-description: >
-  An OpenEnv reinforcement-learning environment that simulates a real-time
-  traffic surveillance control centre. The agent receives structured JSON
-  telemetry data from simulated city intersection cameras (vehicle bounding
-  boxes, GPS coordinates, speeds) and must use API-style actions to detect
-  collisions, identify near-miss events, dispatch emergency services, and
-  update variable message signs upstream of incidents.
-
-author: "OpenEnv Hackathon Submission"
+author: "Traffic Surveillance Team"
 license: "MIT"
+url: "https://huggingface.co/spaces/gaikwadjayvardhan/smart-city-traffic-surveillance-analyst"
 
-# Environment entry-point
-entry_point: "environment:make_env"
-
-# Observation schema summary
-observation:
-  type: object
-  description: "Per-frame telemetry snapshot from the traffic surveillance system"
-  fields:
-    current_frame:
-      type: integer
-      description: "0-indexed frame number currently visible to the agent"
-    total_frames:
-      type: integer
-      description: "Total frames in this episode (default 30)"
-    telemetry_data:
-      type: array
-      items:
-        type: object
-        fields:
-          vehicle_id: { type: string }
-          bbox: { type: array, items: { type: number }, description: "(x1,y1,x2,y2) pixel bounding box" }
-          speed_kmh: { type: number }
-          coordinates: { type: array, items: { type: number }, description: "[lat, lon]" }
-          heading_deg: { type: number }
-    active_alerts:
-      type: array
-      description: "List of alerts generated so far in the episode"
-    done:
-      type: boolean
-    reward:
-      type: number
-      description: "Dense reward for the most recent action"
-
-# Action schema summary
-action:
-  type: object
-  description: "Polymorphic tool-call action"
-  fields:
-    action_type:
-      type: string
-      enum:
-        - tag_collision
-        - tag_near_miss
-        - dispatch_ems
-        - update_signs
-        - advance_frame
-        - noop
-    payload:
-      type: object
-      description: "Action-specific parameters (varies by action_type)"
-
-# Reward structure
-reward:
-  type: continuous
-  range: [-0.5, 1.0]
-  description: >
-    Dense reward signal on every step. Correct action with correct payload = +1.0.
-    Partial credit = +0.2 to +0.5. Incorrect action = -0.1. Hallucinated IDs = -0.3.
-    Duplicate correct action = -0.5.
-
-# Task registry
 tasks:
-  - id: task_1_easy
-    name: collision_tagging
-    difficulty: easy
-    seed: 42
-    max_steps: 40
-    description: >
-      Scan 30 frames and tag the exact frame where two vehicles collide
-      (bounding boxes overlap, speeds drop to zero).
+  - id: "collision_tagging"
+    name: "Collision Tagging"
+    description: "Scan 30 frames and identify the exact frame where two vehicles collide (bounding boxes overlap, speeds drop to zero)."
+    difficulty: "easy"
 
-  - id: task_2_medium
-    name: near_miss_detection
-    difficulty: medium
-    seed: 99
-    max_steps: 50
-    description: >
-      Analyse vehicle trajectory data to identify a near-miss event where
-      a vehicle breached a 10-metre safety radius without collision.
+  - id: "near_miss_detection"
+    name: "Near-Miss Detection"
+    description: "Analyse vehicle trajectory data to identify the vehicle that breached a 10-metre safety radius without colliding."
+    difficulty: "medium"
 
-  - id: task_3_hard
-    name: active_incident_management
-    difficulty: hard
-    seed: 777
-    max_steps: 60
-    description: >
-      Multi-vehicle crash scenario requiring sequential actions: tag collision,
-      dispatch EMS, and update upstream warning signs.
+  - id: "active_incident_management"
+    name: "Active Incident Management"
+    description: "Multi-vehicle crash: tag collision, dispatch EMS to correct coordinates, update upstream warning signs."
+    difficulty: "hard"
 
-# Server configuration
-server:
-  host: "0.0.0.0"
-  port: 7860
-  health_endpoint: "/health"
-  reset_endpoint: "/reset"
-  step_endpoint: "/step"
-  state_endpoint: "/state"
+observation_space: "TrafficObservation"
+action_space: "TrafficAction"
+reward_space: "Reward"
 
-# Docker / HuggingFace Space configuration
-docker:
-  expose_port: 7860
-  base_image: "python:3.11-slim"
+endpoints:
+  health:  /healthz
+  reset:   /reset
+  step:    /step
+  state:   /state
+  grade:   /grader
 
-# Metrics for leaderboard
-metrics:
-  - name: score
-    type: float
-    range: [0.0, 1.0]
-    description: "Grader score for the episode"
-  - name: cumulative_reward
-    type: float
-    description: "Sum of all step rewards across the episode"
-  - name: steps
-    type: integer
-    description: "Number of steps taken in the episode"
+scoring:
+  reward_range: [0.01, 0.989]
+  success_threshold: 0.98
+  score_formula: mean(step_rewards)

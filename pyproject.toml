@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traffic-surveillance-env"
+version = "1.0.0"
+description = "OpenEnv-compliant environment for AI traffic surveillance agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "fastapi>=0.100.0",
+    "pydantic>=2.0",
+    "uvicorn[standard]>=0.23.0",
+    "httpx>=0.24",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+server = "app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml"]

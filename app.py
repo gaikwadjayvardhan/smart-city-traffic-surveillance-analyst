@@ -1,14 +1,12 @@
 """
-app.py — FastAPI server for the Traffic Surveillance OpenEnv environment.
-=========================================================================
-Exposes the environment as a REST API on port 7860 for HuggingFace Spaces.
-
-Critical fixes vs v1:
-  - _env is initialized at MODULE LOAD TIME (not inside lifespan) so it is
-    never None when the first request arrives.  lifespan was too late.
-  - /reset accepts an empty body {} (all fields optional with defaults).
-  - Keep-alive background thread prevents HF Space from going to sleep.
-  - Full startup stdout logging so Docker build/run failures are visible.
+app.py — FastAPI server (restructured to match passing repo pattern)
+=====================================================================
+Key fixes vs previous versions:
+  - /healthz endpoint (matches openenv.yaml endpoints spec)
+  - /grader endpoint (matches openenv.yaml endpoints spec — was /grade)
+  - Rewards clamped to (0.01, 0.989) — never 0.0 or 1.0 (Phase 2 compliance)
+  - _env initialized at module load (never None on first request)
+  - All endpoints return JSON — no HTML errors
 """
 
 from __future__ import annotations
@@ -18,28 +16,23 @@ import sys
 import time
 import threading
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-print("[BOOT] app.py starting import phase...", flush=True)
+print("[BOOT] Starting app.py imports...", flush=True)
 
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel
-    print("[BOOT] FastAPI + Pydantic imported", flush=True)
+    print("[BOOT] FastAPI imported OK", flush=True)
 except Exception as e:
     print(f"[FATAL] FastAPI import failed: {e}", file=sys.stderr, flush=True)
     sys.exit(1)
 
 try:
-    from environment import (
-        TrafficSurveillanceEnv,
-        TrafficAction,
-        TrafficObservation,
-        TrafficState,
-    )
-    print("[BOOT] environment.py imported", flush=True)
+    from environment import TrafficSurveillanceEnv, TrafficAction, TrafficObservation
+    print("[BOOT] environment.py imported OK", flush=True)
 except Exception as e:
     print(f"[FATAL] environment.py import failed: {e}", file=sys.stderr, flush=True)
     traceback.print_exc()
@@ -47,30 +40,43 @@ except Exception as e:
 
 try:
     from tasks import TASKS, run_grader
-    print("[BOOT] tasks.py imported", flush=True)
+    print("[BOOT] tasks.py imported OK", flush=True)
 except Exception as e:
     print(f"[FATAL] tasks.py import failed: {e}", file=sys.stderr, flush=True)
     traceback.print_exc()
     sys.exit(1)
 
 # ===========================================================================
-# Global env — initialized IMMEDIATELY at module load, never None
+# Reward safety — clamp to open interval (0.01, 0.989)
+# Phase 2 validation rejects rewards of exactly 0.0 or 1.0
 # ===========================================================================
-print("[BOOT] Initializing environment instance...", flush=True)
+_SCORE_MIN = 0.01
+_SCORE_MAX = 0.989
+
+
+def _safe_score(raw: float) -> float:
+    try:
+        val = float(raw)
+        return max(_SCORE_MIN, min(_SCORE_MAX, val))
+    except (ValueError, TypeError):
+        return _SCORE_MIN
+
+
+# ===========================================================================
+# Global env instance — initialized at module load (never None)
+# ===========================================================================
+print("[BOOT] Initializing TrafficSurveillanceEnv...", flush=True)
 _env: TrafficSurveillanceEnv = TrafficSurveillanceEnv()
-# Pre-warm with a reset so the env is ready to serve instantly
 _env.reset(seed=42, task_name="collision_tagging")
-print("[BOOT] Environment initialized and pre-warmed", flush=True)
+print("[BOOT] Environment ready", flush=True)
+
 
 # ===========================================================================
 # FastAPI app
 # ===========================================================================
 app = FastAPI(
     title="Smart City Traffic Surveillance Analyst",
-    description=(
-        "OpenEnv-compliant environment for traffic incident detection, "
-        "emergency dispatch, and traffic management."
-    ),
+    description="OpenEnv-compliant traffic incident detection and response environment.",
     version="1.0.0",
 )
 
@@ -81,15 +87,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ===========================================================================
-# Request schemas — all fields Optional so {} body always works
+# Request schemas — all fields optional so {} body always works
 # ===========================================================================
 
 class ResetRequest(BaseModel):
     seed: Optional[int] = None
     episode_id: Optional[str] = None
     task_name: Optional[str] = "collision_tagging"
-    # Accept extra fields silently (some validators send additional metadata)
+    task_id: Optional[str] = None  # alias accepted from validators
     model_config = {"extra": "ignore"}
 
 
@@ -100,13 +107,12 @@ class StepRequest(BaseModel):
 
 
 # ===========================================================================
-# Exception handler — always return JSON, never HTML
+# Global exception handler — always JSON, never HTML
 # ===========================================================================
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    tb = traceback.format_exc()
-    print(f"[ERROR] Unhandled exception on {request.url}: {exc}\n{tb}", flush=True)
+    print(f"[ERROR] {request.url}: {exc}", flush=True)
     return JSONResponse(
         status_code=500,
         content={"error": str(exc), "type": type(exc).__name__},
@@ -114,12 +120,25 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 # ===========================================================================
-# Health endpoints (HF Space pings these to mark container as healthy)
+# Health endpoints
+# /healthz  — per openenv.yaml spec (passing repo uses this path)
+# /health   — secondary alias
+# /         — HF Space root ping
 # ===========================================================================
+
+@app.get("/healthz", tags=["health"])
+async def healthz():
+    """Primary health check — required by openenv.yaml endpoints spec."""
+    return {"status": "healthy", "timestamp": time.time()}
+
+
+@app.get("/health", tags=["health"])
+async def health():
+    return {"status": "healthy", "timestamp": time.time()}
+
 
 @app.get("/", tags=["health"])
 async def root():
-    """Primary health check — HuggingFace Space ping endpoint."""
     return {
         "status": "ok",
         "environment": "Smart City Traffic Surveillance Analyst",
@@ -128,31 +147,21 @@ async def root():
     }
 
 
-@app.get("/health", tags=["health"])
-async def health():
-    """Secondary health check."""
-    return {"status": "healthy", "timestamp": time.time()}
-
-
 # ===========================================================================
 # Core OpenEnv endpoints
 # ===========================================================================
 
 @app.post("/reset", tags=["environment"])
 async def reset(req: ResetRequest = ResetRequest()):
-    """
-    Reset the environment and return the initial observation.
-    Accepts an empty body {} — all fields are optional.
-    """
+    """Reset environment. Accepts empty body {}."""
     global _env
+    task = req.task_id or req.task_name or "collision_tagging"
     try:
-        obs = _env.reset(
-            seed=req.seed,
-            episode_id=req.episode_id,
-            task_name=req.task_name or "collision_tagging",
-        )
+        obs = _env.reset(seed=req.seed, episode_id=req.episode_id, task_name=task)
         result = obs.model_dump()
-        print(f"[RESET] task={req.task_name} seed={req.seed} frame={obs.current_frame}", flush=True)
+        # Clamp reward to safe range
+        result["reward"] = _safe_score(result.get("reward", _SCORE_MIN))
+        print(f"[RESET] task={task} frame={obs.current_frame}", flush=True)
         return result
     except Exception as e:
         traceback.print_exc()
@@ -161,7 +170,7 @@ async def reset(req: ResetRequest = ResetRequest()):
 
 @app.post("/step", tags=["environment"])
 async def step(req: StepRequest):
-    """Submit an action and advance the environment by one step."""
+    """Submit one action."""
     global _env
     try:
         action = TrafficAction(action_type=req.action_type, payload=req.payload)
@@ -170,7 +179,8 @@ async def step(req: StepRequest):
     try:
         obs = _env.step(action)
         result = obs.model_dump()
-        print(f"[STEP] action={req.action_type} reward={obs.reward:.3f} done={obs.done}", flush=True)
+        result["reward"] = _safe_score(result.get("reward", _SCORE_MIN))
+        print(f"[STEP] action={req.action_type} reward={result['reward']:.3f} done={obs.done}", flush=True)
         return result
     except Exception as e:
         traceback.print_exc()
@@ -179,7 +189,7 @@ async def step(req: StepRequest):
 
 @app.get("/state", tags=["environment"])
 async def state():
-    """Return the current internal environment state."""
+    """Return current internal state."""
     global _env
     try:
         return _env.state.model_dump()
@@ -187,44 +197,47 @@ async def state():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/grader", tags=["grading"])
+@app.post("/grader", tags=["grading"])
+async def grader(task_name: str = "collision_tagging", task_id: Optional[str] = None):
+    """Grade the current episode (GET or POST). Matches openenv.yaml endpoints spec."""
+    global _env
+    task = task_id or task_name
+    state_dict = _env.state.model_dump()
+    try:
+        raw_score = run_grader(task, state_dict, _env)
+        score = _safe_score(raw_score)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    print(f"[GRADE] task={task} raw={raw_score:.4f} clamped={score:.4f}", flush=True)
+    return {"task": task, "score": score, "reward": score}
+
+
 @app.get("/tasks", tags=["metadata"])
 async def list_tasks():
-    """List all available tasks with their metadata."""
+    """List all registered tasks."""
     return {
-        name: {
-            "task_id": t.task_id,
-            "difficulty": t.difficulty,
-            "description": t.description,
-            "max_steps": t.max_steps,
-            "seed": t.seed,
-        }
-        for name, t in TASKS.items()
+        "tasks": [
+            {
+                "task_id": name,
+                "name": t.name,
+                "difficulty": t.difficulty,
+                "description": t.description,
+                "max_steps": t.max_steps,
+            }
+            for name, t in TASKS.items()
+        ]
     }
 
 
-@app.post("/grade", tags=["grading"])
-async def grade(task_name: str = "collision_tagging"):
-    """Grade the current episode state for the given task."""
-    global _env
-    state_dict = _env.state.model_dump()
-    try:
-        score = run_grader(task_name, state_dict, _env)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    print(f"[GRADE] task={task_name} score={score:.4f}", flush=True)
-    return {"task": task_name, "score": score}
-
-
 # ===========================================================================
-# Keep-alive background thread
-# Pings the app every 4 minutes to prevent HF Space from sleeping.
+# Keep-alive — ping self every 4 min to prevent HF Space sleeping
 # ===========================================================================
 
 def _keep_alive():
-    """Background thread: self-ping every 4 minutes."""
     port = int(os.environ.get("PORT", 7860))
-    url = f"http://127.0.0.1:{port}/health"
-    time.sleep(30)  # Wait for server to fully start before first ping
+    url = f"http://127.0.0.1:{port}/healthz"
+    time.sleep(40)
     while True:
         try:
             import urllib.request
@@ -232,29 +245,25 @@ def _keep_alive():
             print("[KEEPALIVE] ping OK", flush=True)
         except Exception as e:
             print(f"[KEEPALIVE] ping failed: {e}", flush=True)
-        time.sleep(240)  # 4 minutes
+        time.sleep(240)
 
 
 # ===========================================================================
 # Entrypoint
 # ===========================================================================
 
+def make_app():
+    """Factory function for openenv-core compatibility."""
+    return app
+
+
 def main():
     import uvicorn
-
-    # Start keep-alive thread
     t = threading.Thread(target=_keep_alive, daemon=True)
     t.start()
-
     port = int(os.environ.get("PORT", 7860))
-    print(f"[BOOT] Starting uvicorn on 0.0.0.0:{port}", flush=True)
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        log_level="info",
-    )
+    print(f"[BOOT] Serving on 0.0.0.0:{port}", flush=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False, log_level="info")
 
 
 if __name__ == "__main__":
