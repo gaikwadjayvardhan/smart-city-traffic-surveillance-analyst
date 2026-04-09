@@ -2,11 +2,11 @@
 title: Smart City Traffic Surveillance Analyst
 emoji: 🚦
 colorFrom: red
-colorTo: orange
+colorTo: yellow
 sdk: docker
 app_port: 7860
 license: mit
-short_description: OpenEnv RL environment for traffic incident detection & response
+short_description: OpenEnv RL env for traffic incident detection
 tags:
   - openenv
   - reinforcement-learning
