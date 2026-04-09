@@ -1,0 +1,21 @@
+# Smart City Traffic Surveillance Analyst — Python Dependencies
+# ==============================================================
+# Pin exact versions for reproducibility on 2vCPU / 8GB RAM machines.
+# All packages are pure-Python or have pre-built wheels → fast install.
+
+# Core web framework
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# Data validation (Pydantic v2 — required for openenv-core 0.2.x)
+pydantic==2.10.3
+
+# OpenAI client (inference.py)
+openai>=1.55.0,<2.0.0
+
+# Dotenv support (local dev — reads .env file for credentials)
+python-dotenv==1.0.1
+
+# OpenEnv core (try to install; graceful fallback if not on PyPI yet)
+# Uncomment when openenv-core ships to PyPI:
+# openenv-core>=0.2.3
